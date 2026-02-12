@@ -113,10 +113,11 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
 
     key_fields = ["provider", "price_input_per_1m", "output_tokens_per_s", "context_window"]
     null_rates = {field: float(df[field].isna().mean()) for field in key_fields if field in df.columns}
+    data_quality_warning: str | None = None
     if null_rates and all(rate >= 0.98 for rate in null_rates.values()):
-        raise RuntimeError(
-            "models_latest contains near-empty critical fields (provider/price/speed/context). "
-            "This usually indicates a source schema mismatch during normalization."
+        data_quality_warning = (
+            "models_latest has near-empty provider/price/speed/context fields; "
+            "recommendations may be low-confidence due to source schema mismatch"
         )
 
     if task_profile.max_price_per_1m is not None:
@@ -140,6 +141,17 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
         "general": ["quality_index", "reasoning_index", "coding_index", "math_index"],
     }
     selected_quality_cols = quality_cols[task_profile.task_type]
+    if not any(df[col].notna().any() for col in selected_quality_cols):
+        return _json_safe(
+            {
+                "task_profile": asdict(task_profile),
+                "snapshot_ts": str(df["snapshot_ts"].max()),
+                "recommendations": [],
+                "warning": data_quality_warning
+                or "No quality metrics are available for the selected task type in models_latest.",
+            }
+        )
+
     df["quality_metric"] = df.apply(lambda row: _first_non_null(row, selected_quality_cols), axis=1)
     df["quality_norm"] = _normalize_series(df["quality_metric"])
     df["speed_norm"] = _normalize_series(df["output_tokens_per_s"]) * 0.7 + _normalize_series(df["ttft_s"], invert=True) * 0.3
@@ -175,7 +187,10 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
             }
         )
 
-    return _json_safe({"task_profile": asdict(task_profile), "snapshot_ts": snapshot_ts, "recommendations": recs})
+    payload = {"task_profile": asdict(task_profile), "snapshot_ts": snapshot_ts, "recommendations": recs}
+    if data_quality_warning:
+        payload["warning"] = data_quality_warning
+    return _json_safe(payload)
 
 
 def _extract_budget_from_text(task: str) -> float | None:

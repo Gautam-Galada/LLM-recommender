@@ -62,7 +62,7 @@ def test_extract_budget_accepts_without_dollar_sign() -> None:
     assert _extract_budget_from_text("budget 5 per 1M tokens") == 5.0
 
 
-def test_recommend_raises_on_near_empty_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_recommend_warns_and_returns_empty_on_near_empty_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
     class _FakeConn:
         def execute(self, _query: str):
             class _Result:
@@ -95,5 +95,6 @@ def test_recommend_raises_on_near_empty_metrics(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr("src.recommend.connect", lambda: _FakeConn())
     monkeypatch.setattr("src.recommend.init_warehouse", lambda _con: None)
     profile = parse_task_profile("python debugging", None, None, None)
-    with pytest.raises(RuntimeError, match="schema mismatch"):
-        recommend(profile, topk=5)
+    result = recommend(profile, topk=5)
+    assert result["recommendations"] == []
+    assert "warning" in result
