@@ -43,7 +43,18 @@ def utc_now_iso() -> str:
 
 def _pick(record: dict[str, Any], *keys: str) -> Any:
     for key in keys:
-        if key in record and record[key] is not None:
+        if "." in key:
+            current: Any = record
+            found = True
+            for part in key.split("."):
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                else:
+                    found = False
+                    break
+            if found and current is not None:
+                return current
+        elif key in record and record[key] is not None:
             return record[key]
     return None
 
@@ -88,22 +99,64 @@ def canonical_model_key(model_name: str, provider: str | None) -> str:
 def normalize_records(records: list[dict[str, Any]], source: str, snapshot_ts: str) -> pd.DataFrame:
     normalized: list[dict[str, Any]] = []
     for record in records:
-        model_name = _pick(record, "model_name", "name", "model") or "unknown-model"
-        provider = _pick(record, "provider", "vendor", "lab")
+        model_name = _pick(record, "model_name", "modelName", "name", "model") or "unknown-model"
+        provider = _pick(
+            record,
+            "provider",
+            "provider_name",
+            "providerName",
+            "vendor",
+            "lab",
+            "organization",
+            "developer",
+            "creator.name",
+        )
         row = {
             "snapshot_ts": snapshot_ts,
             "source": source,
             "model_name": str(model_name),
             "provider": str(provider) if provider is not None else None,
-            "quality_index": _to_float(_pick(record, "quality_index", "intelligence_index", "overall_index", "overall")),
-            "coding_index": _to_float(_pick(record, "coding_index", "code_index")),
-            "math_index": _to_float(_pick(record, "math_index")),
-            "reasoning_index": _to_float(_pick(record, "reasoning_index", "reasoning")),
-            "output_tokens_per_s": _to_float(_pick(record, "output_tokens_per_s", "tokens_per_second", "throughput")),
-            "ttft_s": _to_float(_pick(record, "ttft_s", "time_to_first_token", "latency_ttft_s")),
-            "price_input_per_1m": _to_float(_pick(record, "price_input_per_1m", "input_price_per_1m", "input_cost_per_million")),
-            "price_output_per_1m": _to_float(_pick(record, "price_output_per_1m", "output_price_per_1m", "output_cost_per_million")),
-            "context_window": _to_int(_pick(record, "context_window", "context_tokens", "max_context")),
+            "quality_index": _to_float(
+                _pick(record, "quality_index", "intelligence_index", "intelligenceIndex", "overall_index", "overall")
+            ),
+            "coding_index": _to_float(_pick(record, "coding_index", "codingIndex", "code_index")),
+            "math_index": _to_float(_pick(record, "math_index", "mathIndex")),
+            "reasoning_index": _to_float(_pick(record, "reasoning_index", "reasoningIndex", "reasoning")),
+            "output_tokens_per_s": _to_float(
+                _pick(
+                    record,
+                    "output_tokens_per_s",
+                    "outputTokensPerSecond",
+                    "tokens_per_second",
+                    "tokensPerSecond",
+                    "throughput",
+                    "performance.output_tokens_per_s",
+                )
+            ),
+            "ttft_s": _to_float(_pick(record, "ttft_s", "time_to_first_token", "timeToFirstToken", "latency_ttft_s")),
+            "price_input_per_1m": _to_float(
+                _pick(
+                    record,
+                    "price_input_per_1m",
+                    "input_price_per_1m",
+                    "inputPricePer1M",
+                    "input_cost_per_million",
+                    "pricing.input_price_per_1m",
+                    "pricing.inputPricePer1M",
+                )
+            ),
+            "price_output_per_1m": _to_float(
+                _pick(
+                    record,
+                    "price_output_per_1m",
+                    "output_price_per_1m",
+                    "outputPricePer1M",
+                    "output_cost_per_million",
+                    "pricing.output_price_per_1m",
+                    "pricing.outputPricePer1M",
+                )
+            ),
+            "context_window": _to_int(_pick(record, "context_window", "contextWindow", "context_tokens", "max_context", "maxContext")),
             "is_open_source": _to_bool(_pick(record, "is_open_source", "open_source")),
             "license": _pick(record, "license", "license_type"),
         }

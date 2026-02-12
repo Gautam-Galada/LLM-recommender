@@ -111,6 +111,14 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
     if df.empty:
         return _json_safe({"task_profile": asdict(task_profile), "snapshot_ts": None, "recommendations": []})
 
+    key_fields = ["provider", "price_input_per_1m", "output_tokens_per_s", "context_window"]
+    null_rates = {field: float(df[field].isna().mean()) for field in key_fields if field in df.columns}
+    if null_rates and all(rate >= 0.98 for rate in null_rates.values()):
+        raise RuntimeError(
+            "models_latest contains near-empty critical fields (provider/price/speed/context). "
+            "This usually indicates a source schema mismatch during normalization."
+        )
+
     if task_profile.max_price_per_1m is not None:
         df = df[(df["price_input_per_1m"] <= task_profile.max_price_per_1m) | (df["price_input_per_1m"].isna())]
     if task_profile.min_context is not None:
@@ -171,7 +179,7 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
 
 
 def _extract_budget_from_text(task: str) -> float | None:
-    match = re.search(r"\$\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*1m", task.lower())
+    match = re.search(r"(?:\$\s*)?([0-9]+(?:\.[0-9]+)?)\s*(?:/|per)\s*1m", task.lower())
     if not match:
         return None
     return float(match.group(1))
