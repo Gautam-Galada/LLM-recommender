@@ -47,7 +47,12 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def parse_task_profile(task_text: str, max_price_per_1m: float | None, min_context: int | None, provider_allowlist: str | None) -> TaskProfile:
+def parse_task_profile(
+    task_text: str,
+    max_price_per_1m: float | None,
+    min_context: int | None,
+    provider_allowlist: str | None,
+) -> TaskProfile:
     text = task_text.lower()
     task_type = "general"
     for name, keywords in TASK_KEYWORDS.items():
@@ -90,17 +95,39 @@ def _first_non_null(row: pd.Series, cols: list[str]) -> float:
     return 0.0
 
 
-def _normalize_series(series: pd.Series, invert: bool = False) -> pd.Series:
-    filled = series.fillna(series.median() if not series.dropna().empty else 0.0)
+def _normalize_series(series: pd.Series, invert: bool = False, *, missing_policy: str = "neutral") -> pd.Series:
+    """
+    Normalize into [0,1].
+
+    missing_policy:
+      - "neutral": fill missing with median (existing behavior)
+      - "penalize": fill missing with worst-case for the metric
+          * for non-inverted metrics (higher is better), missing -> min
+          * for inverted metrics (lower is better), missing -> max
+    """
+    s = series.astype("float64")
+
+    if s.dropna().empty:
+        filled = s.fillna(0.0)
+    else:
+        if missing_policy == "neutral":
+            filled = s.fillna(float(s.median()))
+        elif missing_policy == "penalize":
+            penalty = float(s.max()) if invert else float(s.min())
+            filled = s.fillna(penalty)
+        else:
+            raise ValueError(f"unknown missing_policy={missing_policy!r}")
+
     min_val, max_val = float(filled.min()), float(filled.max())
     if abs(max_val - min_val) < 1e-9:
         norm = pd.Series([0.5] * len(filled), index=filled.index)
     else:
         norm = (filled - min_val) / (max_val - min_val)
+
     return 1 - norm if invert else norm
 
 
-def recommend(task_profile: TaskProfile, topk: int) -> dict:
+def recommend(task_profile: TaskProfile, topk: int, *, missing_policy: str = "penalize") -> dict:
     con = connect()
     try:
         init_warehouse(con)
@@ -153,9 +180,14 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
         )
 
     df["quality_metric"] = df.apply(lambda row: _first_non_null(row, selected_quality_cols), axis=1)
-    df["quality_norm"] = _normalize_series(df["quality_metric"])
-    df["speed_norm"] = _normalize_series(df["output_tokens_per_s"]) * 0.7 + _normalize_series(df["ttft_s"], invert=True) * 0.3
-    df["cost_norm"] = _normalize_series(df["price_input_per_1m"], invert=True)
+    df["quality_norm"] = _normalize_series(df["quality_metric"], missing_policy="neutral")
+
+    # Penalize missing speed/cost by default (so unknown doesn't look "median-good")
+    df["speed_norm"] = (
+        _normalize_series(df["output_tokens_per_s"], missing_policy=missing_policy) * 0.7
+        + _normalize_series(df["ttft_s"], invert=True, missing_policy=missing_policy) * 0.3
+    )
+    df["cost_norm"] = _normalize_series(df["price_input_per_1m"], invert=True, missing_policy=missing_policy)
 
     df["score"] = (
         task_profile.weight_quality * df["quality_norm"]
@@ -194,10 +226,31 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
 
 
 def _extract_budget_from_text(task: str) -> float | None:
-    match = re.search(r"(?:\$\s*)?([0-9]+(?:\.[0-9]+)?)\s*(?:/|per)\s*1m", task.lower())
-    if not match:
-        return None
-    return float(match.group(1))
+    """
+    Extract budget like:
+      "$5/1M", "$5 / 1m tokens", "5 per 1m", "5/1 million", "$5 per 1 million"
+    Returns dollars per 1M tokens (input) as float.
+    """
+    text = task.lower()
+
+    patterns = [
+        r"\$\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/|per)\s*1\s*m\b",  # $5/1m
+        r"\$\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/|per)\s*1\s*m\s*tokens?\b",  # $5/1m tokens
+        r"\$\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/|per)\s*1\s*m\s*tok(?:ens?)?\b",  # $5/1m tok
+        r"\$\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/|per)\s*1\s*million\b",  # $5/1 million
+        r"\$\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/|per)\s*1\s*million\s*tokens?\b",  # $5/1 million tokens
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:/|per)\s*1\s*m\b",  # 5/1m
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:/|per)\s*1\s*million\b",  # 5/1 million
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+    return None
 
 
 def main() -> None:
@@ -207,6 +260,13 @@ def main() -> None:
     parser.add_argument("--max-price-per-1m", type=float, default=None)
     parser.add_argument("--min-context", type=int, default=None)
     parser.add_argument("--provider-allowlist", type=str, default=None, help="Comma-separated providers")
+    parser.add_argument(
+        "--missing-policy",
+        type=str,
+        default="penalize",
+        choices=["neutral", "penalize"],
+        help="How to treat missing speed/cost metrics during scoring",
+    )
     args = parser.parse_args()
 
     max_price = args.max_price_per_1m if args.max_price_per_1m is not None else _extract_budget_from_text(args.task_text)
@@ -216,7 +276,7 @@ def main() -> None:
         min_context=args.min_context,
         provider_allowlist=args.provider_allowlist,
     )
-    result = recommend(profile, topk=args.topk)
+    result = recommend(profile, topk=args.topk, missing_policy=args.missing_policy)
     print(json.dumps(_json_safe(result), indent=2))
 
 
