@@ -2,10 +2,25 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+
+def _api_key_from_env_file(env_path: str = ".env") -> str | None:
+    path = Path(env_path)
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "AA_API_KEY":
+            return value.strip().strip('"').strip("'")
+    return None
 
 
 class ArtificialAnalysisError(RuntimeError):
@@ -17,7 +32,7 @@ class ArtificialAnalysisConnector:
     endpoint: str = "https://artificialanalysis.ai/api/v2/data/llms/models"
 
     def fetch(self) -> list[dict[str, Any]]:
-        api_key = os.getenv("AA_API_KEY")
+        api_key = os.getenv("AA_API_KEY") or _api_key_from_env_file()
         if not api_key:
             raise ArtificialAnalysisError("AA_API_KEY is not set")
 

@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 data/warehouse.duckdb
 logs/
+.env
+data/bronze/
+src/__pycache__/
+tests/__pycache__/

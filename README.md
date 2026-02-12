@@ -30,10 +30,18 @@ tests/
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install duckdb pandas pyarrow pytest
+pip install -r requirements.txt
 ```
 
 ## Configure API key (optional but preferred)
+
+
+You can also create a local `.env` file:
+
+```bash
+cp .env.example .env
+# edit .env with your real key
+```
 
 ```bash
 export AA_API_KEY="your_key_here"
