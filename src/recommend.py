@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from dataclasses import asdict
+from datetime import date, datetime
+from typing import Any
 
 import pandas as pd
 
@@ -18,6 +21,30 @@ TASK_KEYWORDS = {
     "rag": ["rag", "retrieval", "documents", "knowledge base"],
     "agent": ["agent", "tool use", "autonomous", "workflow"],
 }
+
+
+def _json_safe(value: Any) -> Any:
+    if value is pd.NA:
+        return None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return sorted(_json_safe(v) for v in value)
+    if isinstance(value, (datetime, date, pd.Timestamp)):
+        return value.isoformat()
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _json_safe(item())
+        except (TypeError, ValueError):
+            pass
+    return value
 
 
 def parse_task_profile(task_text: str, max_price_per_1m: float | None, min_context: int | None, provider_allowlist: str | None) -> TaskProfile:
@@ -82,7 +109,7 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
         con.close()
 
     if df.empty:
-        return {"task_profile": asdict(task_profile), "snapshot_ts": None, "recommendations": []}
+        return _json_safe({"task_profile": asdict(task_profile), "snapshot_ts": None, "recommendations": []})
 
     if task_profile.max_price_per_1m is not None:
         df = df[(df["price_input_per_1m"] <= task_profile.max_price_per_1m) | (df["price_input_per_1m"].isna())]
@@ -93,7 +120,7 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
         df = df[providers.isin(task_profile.provider_allowlist)]
 
     if df.empty:
-        return {"task_profile": asdict(task_profile), "snapshot_ts": None, "recommendations": []}
+        return _json_safe({"task_profile": asdict(task_profile), "snapshot_ts": None, "recommendations": []})
 
     quality_cols = {
         "coding": ["coding_index", "quality_index", "reasoning_index"],
@@ -140,7 +167,7 @@ def recommend(task_profile: TaskProfile, topk: int) -> dict:
             }
         )
 
-    return {"task_profile": asdict(task_profile), "snapshot_ts": snapshot_ts, "recommendations": recs}
+    return _json_safe({"task_profile": asdict(task_profile), "snapshot_ts": snapshot_ts, "recommendations": recs})
 
 
 def _extract_budget_from_text(task: str) -> float | None:
@@ -167,7 +194,7 @@ def main() -> None:
         provider_allowlist=args.provider_allowlist,
     )
     result = recommend(profile, topk=args.topk)
-    print(json.dumps(result, indent=2))
+    print(json.dumps(_json_safe(result), indent=2))
 
 
 if __name__ == "__main__":

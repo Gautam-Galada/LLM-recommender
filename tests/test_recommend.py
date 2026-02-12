@@ -1,5 +1,9 @@
+import json
+
+import pandas as pd
+
 from src.ingest import run_ingest
-from src.recommend import parse_task_profile, recommend
+from src.recommend import _json_safe, parse_task_profile, recommend
 
 
 def test_parse_task_profile_detects_coding_and_budget() -> None:
@@ -43,3 +47,11 @@ def test_recommend_hard_constraint_filter() -> None:
     )
     result = recommend(profile, topk=3)
     assert result["recommendations"] == []
+
+
+def test_json_safe_handles_pandas_na_and_sets() -> None:
+    payload = {"x": pd.NA, "providers": {"meta", "openai"}}
+    safe = _json_safe(payload)
+    assert safe["x"] is None
+    assert safe["providers"] == ["meta", "openai"]
+    json.dumps(safe)
