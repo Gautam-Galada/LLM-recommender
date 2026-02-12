@@ -5,7 +5,7 @@ import json
 import math
 import re
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -100,7 +100,7 @@ def _normalize_series(series: pd.Series, invert: bool = False, *, missing_policy
     Normalize into [0,1].
 
     missing_policy:
-      - "neutral": fill missing with median (existing behavior)
+      - "neutral": fill missing with median
       - "penalize": fill missing with worst-case for the metric
           * for non-inverted metrics (higher is better), missing -> min
           * for inverted metrics (lower is better), missing -> max
@@ -127,7 +127,68 @@ def _normalize_series(series: pd.Series, invert: bool = False, *, missing_policy
     return 1 - norm if invert else norm
 
 
-def recommend(task_profile: TaskProfile, topk: int, *, missing_policy: str = "penalize") -> dict:
+def _latest_snapshot_ts_utc() -> datetime | None:
+    """
+    Read max(snapshot_ts) from models_latest. Returns timezone-aware UTC datetime if available.
+    If table doesn't exist / empty / error, returns None.
+    """
+    con = connect()
+    try:
+        init_warehouse(con)
+        row = con.execute("SELECT max(snapshot_ts) AS max_ts FROM models_latest").fetchone()
+        max_ts = row[0] if row else None
+        if max_ts is None:
+            return None
+
+        # duckdb returns Python datetime (naive). Treat as UTC.
+        if isinstance(max_ts, datetime):
+            return max_ts.replace(tzinfo=timezone.utc) if max_ts.tzinfo is None else max_ts.astimezone(timezone.utc)
+
+        # fallback: parse string
+        parsed = datetime.fromisoformat(str(max_ts))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+    finally:
+        con.close()
+
+
+def _maybe_refresh_warehouse(*, refresh: bool, max_age_hours: float) -> str | None:
+    """
+    Option A: auto-refresh on recommend.
+    - If refresh=True: always run ingest.
+    - Else: run ingest only if latest snapshot is older than max_age_hours or missing.
+
+    Returns a warning string if refresh was attempted but failed; otherwise None.
+    """
+    now = datetime.now(tz=timezone.utc)
+    latest = _latest_snapshot_ts_utc()
+
+    needs_refresh = refresh or latest is None or (now - latest) > timedelta(hours=max_age_hours)
+    if not needs_refresh:
+        return None
+
+    try:
+        # Lazy import to avoid any circular import headaches at module import time.
+        from src.ingest import run_ingest
+
+        run_ingest()
+        return None
+    except Exception as exc:
+        # If refresh fails, we still proceed using existing warehouse state.
+        return f"Refresh failed; using existing warehouse snapshot. Error: {exc!s}"
+
+
+def recommend(
+    task_profile: TaskProfile,
+    topk: int,
+    *,
+    missing_policy: str = "penalize",
+    refresh: bool = False,
+    max_age_hours: float = 24.0,
+) -> dict:
+    refresh_warning = _maybe_refresh_warehouse(refresh=refresh, max_age_hours=max_age_hours)
+
     con = connect()
     try:
         init_warehouse(con)
@@ -136,7 +197,10 @@ def recommend(task_profile: TaskProfile, topk: int, *, missing_policy: str = "pe
         con.close()
 
     if df.empty:
-        return _json_safe({"task_profile": asdict(task_profile), "snapshot_ts": None, "recommendations": []})
+        payload = {"task_profile": asdict(task_profile), "snapshot_ts": None, "recommendations": []}
+        if refresh_warning:
+            payload["warning"] = refresh_warning
+        return _json_safe(payload)
 
     key_fields = ["provider", "price_input_per_1m", "output_tokens_per_s", "context_window"]
     null_rates = {field: float(df[field].isna().mean()) for field in key_fields if field in df.columns}
@@ -156,7 +220,10 @@ def recommend(task_profile: TaskProfile, topk: int, *, missing_policy: str = "pe
         df = df[providers.isin(task_profile.provider_allowlist)]
 
     if df.empty:
-        return _json_safe({"task_profile": asdict(task_profile), "snapshot_ts": None, "recommendations": []})
+        payload = {"task_profile": asdict(task_profile), "snapshot_ts": None, "recommendations": []}
+        if refresh_warning:
+            payload["warning"] = refresh_warning
+        return _json_safe(payload)
 
     quality_cols = {
         "coding": ["coding_index", "quality_index", "reasoning_index"],
@@ -169,20 +236,20 @@ def recommend(task_profile: TaskProfile, topk: int, *, missing_policy: str = "pe
     }
     selected_quality_cols = quality_cols[task_profile.task_type]
     if not any(df[col].notna().any() for col in selected_quality_cols):
-        return _json_safe(
-            {
-                "task_profile": asdict(task_profile),
-                "snapshot_ts": str(df["snapshot_ts"].max()),
-                "recommendations": [],
-                "warning": data_quality_warning
-                or "No quality metrics are available for the selected task type in models_latest.",
-            }
-        )
+        payload = {
+            "task_profile": asdict(task_profile),
+            "snapshot_ts": str(df["snapshot_ts"].max()),
+            "recommendations": [],
+            "warning": data_quality_warning
+            or "No quality metrics are available for the selected task type in models_latest.",
+        }
+        if refresh_warning:
+            payload["warning"] = f"{payload['warning']} | {refresh_warning}"
+        return _json_safe(payload)
 
     df["quality_metric"] = df.apply(lambda row: _first_non_null(row, selected_quality_cols), axis=1)
     df["quality_norm"] = _normalize_series(df["quality_metric"], missing_policy="neutral")
 
-    # Penalize missing speed/cost by default (so unknown doesn't look "median-good")
     df["speed_norm"] = (
         _normalize_series(df["output_tokens_per_s"], missing_policy=missing_policy) * 0.7
         + _normalize_series(df["ttft_s"], invert=True, missing_policy=missing_policy) * 0.3
@@ -197,7 +264,8 @@ def recommend(task_profile: TaskProfile, topk: int, *, missing_policy: str = "pe
 
     ranked = df.sort_values("score", ascending=False).head(topk)
     snapshot_ts = str(ranked["snapshot_ts"].max()) if not ranked.empty else None
-    recs = []
+
+    recs: list[dict[str, Any]] = []
     for _, row in ranked.iterrows():
         recs.append(
             {
@@ -219,9 +287,16 @@ def recommend(task_profile: TaskProfile, topk: int, *, missing_policy: str = "pe
             }
         )
 
-    payload = {"task_profile": asdict(task_profile), "snapshot_ts": snapshot_ts, "recommendations": recs}
+    payload: dict[str, Any] = {"task_profile": asdict(task_profile), "snapshot_ts": snapshot_ts, "recommendations": recs}
+
+    warnings: list[str] = []
     if data_quality_warning:
-        payload["warning"] = data_quality_warning
+        warnings.append(data_quality_warning)
+    if refresh_warning:
+        warnings.append(refresh_warning)
+    if warnings:
+        payload["warning"] = " | ".join(warnings)
+
     return _json_safe(payload)
 
 
@@ -267,6 +342,20 @@ def main() -> None:
         choices=["neutral", "penalize"],
         help="How to treat missing speed/cost metrics during scoring",
     )
+
+    # Option A: auto-refresh on recommend
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force refresh by running ingestion before recommending (falls back to existing data if refresh fails).",
+    )
+    parser.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=24.0,
+        help="If the latest snapshot is older than this, run ingestion before recommending (ignored if --refresh).",
+    )
+
     args = parser.parse_args()
 
     max_price = args.max_price_per_1m if args.max_price_per_1m is not None else _extract_budget_from_text(args.task_text)
@@ -276,7 +365,14 @@ def main() -> None:
         min_context=args.min_context,
         provider_allowlist=args.provider_allowlist,
     )
-    result = recommend(profile, topk=args.topk, missing_policy=args.missing_policy)
+
+    result = recommend(
+        profile,
+        topk=args.topk,
+        missing_policy=args.missing_policy,
+        refresh=args.refresh,
+        max_age_hours=args.max_age_hours,
+    )
     print(json.dumps(_json_safe(result), indent=2))
 
 
