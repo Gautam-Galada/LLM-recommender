@@ -1,5 +1,8 @@
 # LLM Recommender (Local Parquet + DuckDB)
 
+<img width="522" height="713" alt="image" src="https://github.com/user-attachments/assets/e985892f-b907-40df-9b1e-addad58d92a0" />
+
+
 A local, reproducible data system for ingesting LLM benchmark, pricing, and performance data and ranking models for a given task using a multi-objective scoring engine.
 
 ---
