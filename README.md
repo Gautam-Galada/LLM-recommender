@@ -1,4 +1,4 @@
-# LLM Recommender (Local Parquet + DuckDB)
+# LLM Recommender (Local Parquet + DuckDB) [Underprogess]
 
 <p align="center">
   <img width="522" height="713" alt="image"
